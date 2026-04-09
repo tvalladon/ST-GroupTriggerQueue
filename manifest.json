@@ -1,0 +1,12 @@
+{
+    "display_name": "Group Trigger Queue",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "",
+    "author": "tvalladon",
+    "version": "1.0.0",
+    "homePage": "https://github.com/tvalladon/ST-GroupTriggerQueue",
+    "auto_update": true
+}
