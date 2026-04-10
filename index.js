@@ -4,24 +4,31 @@
  * Intercepts group member trigger ("speak") button clicks and queues them
  * when generation is already in progress. Auto-advances the queue when
  * each generation finishes. Click a queued character again to dequeue.
+ *
+ * Uses ST's native queue display system (.is_queued, .is_active, .queue_position)
+ * so the "Show group chat queue" setting controls visibility as expected.
  */
 
-// Imports relative to /scripts/extensions/third-party/ST-GroupTriggerQueue/
-import { getContext, extension_settings } from '../../../extensions.js';
-import { eventSource, event_types, is_send_press } from '../../../../script.js';
-import { selected_group, is_group_generating } from '../../../group-chats.js';
-import { executeSlashCommandsWithOptions } from '../../../slash-commands.js';
+import { eventSource, event_types, is_send_press, Generate } from '../../../../script.js';
+import { is_group_generating } from '../../../group-chats.js';
+import { power_user } from '../../../power-user.js';
 
 const EXT_NAME = 'ST-GroupTriggerQueue';
 
 /** @type {{ chid: number, name: string }[]} */
 let queue = [];
 
-/** True while the extension is actively processing the queue (firing /trigger) */
+/** True while the extension is actively processing the queue */
 let isProcessingQueue = false;
 
 /** True if user manually started generation while queue was active */
 let userInitiatedGeneration = false;
+
+/** Timeout ID for the pending queue advance, prevents double-firing */
+let pendingAdvanceTimeout = null;
+
+/** MutationObserver reference for cleanup */
+let memberListObserver = null;
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 
@@ -30,7 +37,7 @@ function isGenerating() {
 }
 
 /**
- * Get character name from a .group_member DOM element.
+ * Get character info from a .group_member DOM element.
  * @param {Element} memberEl
  * @returns {{ chid: number, name: string } | null}
  */
@@ -41,38 +48,28 @@ function getMemberInfo(memberEl) {
     return { chid, name };
 }
 
-/**
- * Check if a member element represents a muted/disabled character.
- * @param {Element} memberEl
- * @returns {boolean}
- */
-function isMuted(memberEl) {
-    return memberEl.classList.contains('disabled');
-}
-
 // ─── Queue management ─────────────────────────────────────────────────
 
 function clearQueue() {
     queue = [];
-    updateAllBadges();
+    updateQueueDisplay();
     console.debug(`[${EXT_NAME}] Queue cleared`);
 }
 
 function enqueue(chid, name) {
+    if (isQueued(chid)) return;
     queue.push({ chid, name });
     console.debug(`[${EXT_NAME}] Enqueued: ${name} (position ${queue.length})`);
-    updateAllBadges();
+    updateQueueDisplay();
 }
 
 function dequeue(chid) {
     const idx = queue.findIndex(entry => entry.chid === chid);
-    if (idx !== -1) {
-        const removed = queue.splice(idx, 1)[0];
-        console.debug(`[${EXT_NAME}] Dequeued: ${removed.name}`);
-        updateAllBadges();
-        return true;
-    }
-    return false;
+    if (idx === -1) return false;
+    const removed = queue.splice(idx, 1)[0];
+    console.debug(`[${EXT_NAME}] Dequeued: ${removed.name}`);
+    updateQueueDisplay();
+    return true;
 }
 
 function isQueued(chid) {
@@ -83,24 +80,33 @@ function queuePosition(chid) {
     return queue.findIndex(entry => entry.chid === chid) + 1; // 1-based, 0 = not found
 }
 
-// ─── Badge display ────────────────────────────────────────────────────
+// ─── Queue display ────────────────────────────────────────────────────
 
-/** Update badge numbers on all visible group member speak buttons. */
-function updateAllBadges() {
+/**
+ * Apply queue state to all visible group members using ST's native
+ * .is_queued class and .queue_position text. Respects the
+ * "Show group chat queue" user setting — cleans up if disabled.
+ */
+function updateQueueDisplay() {
     const members = document.querySelectorAll('#rm_group_members .group_member');
+    // Offset queue numbers by 1 when a character is actively generating,
+    // since ST shows that character as #1 via is_active
+    const offset = isProcessingQueue || isGenerating() ? 1 : 0;
+
     members.forEach(memberEl => {
         const chid = Number(memberEl.getAttribute('data-chid'));
-        const speakBtn = memberEl.querySelector('[data-action="speak"]');
-        if (!speakBtn) return;
-
         const pos = queuePosition(chid);
-        // Use a data attribute + CSS ::after for the badge
-        if (pos > 0) {
-            speakBtn.setAttribute('data-queue-pos', pos);
-            speakBtn.classList.add('gtq-queued');
+        const queuePosEl = memberEl.querySelector('.queue_position');
+
+        if (pos > 0 && power_user.show_group_chat_queue) {
+            memberEl.classList.add('is_queued');
+            if (queuePosEl) queuePosEl.textContent = pos + offset;
         } else {
-            speakBtn.removeAttribute('data-queue-pos');
-            speakBtn.classList.remove('gtq-queued');
+            memberEl.classList.remove('is_queued');
+            // Preserve queue_position text if ST set is_active on this member
+            if (queuePosEl && !memberEl.classList.contains('is_active')) {
+                queuePosEl.textContent = '';
+            }
         }
     });
 }
@@ -112,7 +118,6 @@ function updateAllBadges() {
  * Fires before jQuery's delegated click handler so we can intercept.
  */
 function onSpeakClick(event) {
-    // Only intercept clicks on the speak button
     const speakBtn = event.target.closest('[data-action="speak"]');
     if (!speakBtn) return;
 
@@ -132,7 +137,7 @@ function onSpeakClick(event) {
 
     // If nothing is generating and queue is empty, let the click through normally
     if (!isGenerating() && queue.length === 0 && !isProcessingQueue) {
-        return; // ST's default handler will fire the trigger
+        return;
     }
 
     // Otherwise, intercept and enqueue
@@ -146,7 +151,6 @@ function attachInterceptor() {
     const container = document.getElementById('rm_group_members');
     if (!container) return;
 
-    // Remove previous listener to avoid duplicates (same function reference)
     container.removeEventListener('click', onSpeakClick, true);
     container.addEventListener('click', onSpeakClick, true);
     console.debug(`[${EXT_NAME}] Click interceptor attached`);
@@ -155,50 +159,33 @@ function attachInterceptor() {
 // ─── Queue processing (auto-advance) ─────────────────────────────────
 
 /**
- * Fires the next character in the queue via /trigger.
- * Called when generation ends and the queue is non-empty.
+ * Fires the next character in the queue via Generate().
+ * Uses the same call as ST's native speak button handler to avoid
+ * slash command parsing and any injection risk from character names.
  */
 async function processNextInQueue() {
-    if (queue.length === 0) {
+    // Bail if queue was cleared (stop, user message, chat switch)
+    if (queue.length === 0 || userInitiatedGeneration) {
         isProcessingQueue = false;
-        return;
-    }
-
-    // Skip muted characters
-    while (queue.length > 0) {
-        const next = queue[0];
-        const memberEl = document.querySelector(
-            `#rm_group_members .group_member[data-chid="${next.chid}"]`
-        );
-
-        if (memberEl && isMuted(memberEl)) {
-            console.debug(`[${EXT_NAME}] Skipping muted character: ${next.name}`);
-            queue.shift();
-            updateAllBadges();
-            continue;
-        }
-        break;
-    }
-
-    if (queue.length === 0) {
-        isProcessingQueue = false;
-        updateAllBadges();
+        updateQueueDisplay();
         return;
     }
 
     const next = queue.shift();
-    updateAllBadges();
-
     isProcessingQueue = true;
-    console.debug(`[${EXT_NAME}] Triggering: ${next.name}`);
+    updateQueueDisplay();
+    console.debug(`[${EXT_NAME}] Triggering: ${next.name} (chid: ${next.chid})`);
 
     try {
-        await executeSlashCommandsWithOptions(`/trigger await=true ${next.name}`);
+        await Generate('normal', { force_chid: next.chid });
     } catch (err) {
         console.error(`[${EXT_NAME}] Error triggering ${next.name}:`, err);
-        isProcessingQueue = false;
     }
-    // processNextInQueue will be called again by the GENERATION_ENDED handler
+
+    // Continue processing — don't rely on onGenerationEnded since
+    // isProcessingQueue is true, which blocks the event handler.
+    // Small delay to let ST finish post-generation cleanup.
+    setTimeout(() => processNextInQueue(), 300);
 }
 
 // ─── Event hooks ──────────────────────────────────────────────────────
@@ -206,30 +193,37 @@ async function processNextInQueue() {
 /**
  * GENERATION_ENDED: auto-advance the queue unless the user started a
  * manual generation (typed a message or clicked Generate themselves).
+ * Uses a debounced timeout to prevent double-firing from rapid events.
  */
 function onGenerationEnded() {
     if (userInitiatedGeneration) {
-        // User manually started something — clear the queue
         console.debug(`[${EXT_NAME}] User-initiated generation detected, clearing queue`);
+        clearTimeout(pendingAdvanceTimeout);
+        pendingAdvanceTimeout = null;
         clearQueue();
         isProcessingQueue = false;
         userInitiatedGeneration = false;
         return;
     }
 
-    // Small delay to let ST finish its post-generation cleanup
-    setTimeout(() => {
-        if (queue.length > 0) {
-            processNextInQueue();
-        } else {
-            isProcessingQueue = false;
-        }
-    }, 300);
+    // Only kick off processing if not already running — processNextInQueue
+    // self-loops once started, so we just handle the initial trigger here.
+    if (!isProcessingQueue && queue.length > 0) {
+        clearTimeout(pendingAdvanceTimeout);
+        pendingAdvanceTimeout = setTimeout(() => {
+            pendingAdvanceTimeout = null;
+            if (queue.length > 0 && !isProcessingQueue) {
+                processNextInQueue();
+            }
+        }, 300);
+    }
 }
 
 /** GENERATION_STOPPED: user hit Stop — clear the queue. */
 function onGenerationStopped() {
     console.debug(`[${EXT_NAME}] Generation stopped, clearing queue`);
+    clearTimeout(pendingAdvanceTimeout);
+    pendingAdvanceTimeout = null;
     clearQueue();
     isProcessingQueue = false;
     userInitiatedGeneration = false;
@@ -237,76 +231,71 @@ function onGenerationStopped() {
 
 /**
  * Detect user-initiated messages. When the user sends a new message,
- * we flag it so the queue clears on the next GENERATION_ENDED.
+ * flag it so the queue clears on the next GENERATION_ENDED.
  */
 function onUserMessageRendered() {
     if (queue.length > 0 || isProcessingQueue) {
+        // Flag so the queue clears when the current generation ends.
+        // Note: if a queued Generate() is in flight, the user's new message
+        // could overlap. ST's is_send_press guard should prevent this, but
+        // we clear the queue regardless to avoid stale state.
         userInitiatedGeneration = true;
     }
 }
 
-/** GROUP_UPDATED / chat load: re-attach interceptor since ST re-renders the member list. */
+/** GROUP_UPDATED: re-attach interceptor and re-apply queue display after ST re-renders. */
 function onGroupUpdated() {
     attachInterceptor();
-    updateAllBadges();
+    observeMemberList();
+    updateQueueDisplay();
 }
 
-/** Chat switch: reset everything. */
+/** Chat switch: reset all state. */
 function onChatChanged() {
+    clearTimeout(pendingAdvanceTimeout);
+    pendingAdvanceTimeout = null;
     clearQueue();
     isProcessingQueue = false;
     userInitiatedGeneration = false;
-    // Re-attach after a brief delay to let the DOM settle
-    setTimeout(() => attachInterceptor(), 100);
+    setTimeout(() => {
+        attachInterceptor();
+        observeMemberList();
+    }, 100);
 }
 
 // ─── Initialization ───────────────────────────────────────────────────
 
-function injectStyles() {
-    const style = document.createElement('style');
-    style.id = `${EXT_NAME}-styles`;
-    style.textContent = `
-        /* Queue position badge on speak button */
-        .gtq-queued {
-            position: relative;
+/**
+ * Observe #rm_group_members for child changes (ST re-renders member list).
+ * Re-apply queue display synchronously before browser paint to avoid flash.
+ */
+function observeMemberList() {
+    const container = document.getElementById('rm_group_members');
+    if (!container) return;
+
+    if (memberListObserver) {
+        memberListObserver.disconnect();
+    }
+
+    memberListObserver = new MutationObserver(() => {
+        if (queue.length > 0) {
+            updateQueueDisplay();
         }
-        .gtq-queued::after {
-            content: attr(data-queue-pos);
-            position: absolute;
-            top: -6px;
-            right: -6px;
-            background: var(--SmartThemeQuoteColor, #e67e22);
-            color: var(--SmartThemeBodyColor, #fff);
-            font-size: 10px;
-            font-weight: bold;
-            width: 16px;
-            height: 16px;
-            border-radius: 50%;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            pointer-events: none;
-            z-index: 1;
-            line-height: 1;
-        }
-    `;
-    document.head.appendChild(style);
+    });
+
+    memberListObserver.observe(container, { childList: true });
+    console.debug(`[${EXT_NAME}] MutationObserver attached to #rm_group_members`);
 }
 
 (function init() {
-    // Only activate in group chats, but register listeners globally —
-    // the handlers themselves check for group context where needed.
-    injectStyles();
-
-    // Event hooks for queue advancement and clearing
     eventSource.on(event_types.GENERATION_ENDED, onGenerationEnded);
     eventSource.on(event_types.GENERATION_STOPPED, onGenerationStopped);
     eventSource.on(event_types.USER_MESSAGE_RENDERED, onUserMessageRendered);
     eventSource.on(event_types.CHAT_CHANGED, onChatChanged);
     eventSource.on(event_types.GROUP_UPDATED, onGroupUpdated);
 
-    // Initial attachment
     attachInterceptor();
+    observeMemberList();
 
     console.log(`[${EXT_NAME}] Extension loaded`);
 })();
